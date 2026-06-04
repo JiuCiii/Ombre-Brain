@@ -27,6 +27,11 @@ log_level: "INFO"
 # 存新记忆时，如果与已有桶的相似度超过此值（0-100），则合并而非新建
 merge_threshold: 75
 
+# proposal: keep the new memory and create a review proposal before merging
+# direct: legacy behavior, merge immediately
+# proposal：先保留新记忆并生成审核提案；direct：兼容旧版，立即合并
+merge_mode: "proposal"
+
 # --- Dehydration API / 脱水压缩 API 配置 ---
 # Uses a cheap LLM for intelligent compression. API is required; if the
 # configured key/endpoint is unavailable, hold/grow will raise an explicit

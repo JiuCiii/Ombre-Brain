@@ -36,6 +36,7 @@ from typing import Optional
 import frontmatter
 from rapidfuzz import fuzz
 
+from audit_ledger import AuditLedger
 from utils import generate_bucket_id, sanitize_name, safe_path, now_iso
 
 logger = logging.getLogger("ombre_brain.bucket")
@@ -91,6 +92,7 @@ class BucketManager:
 
         # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
         self.embedding_engine = embedding_engine
+        self.audit = AuditLedger(self.base_dir)
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -110,6 +112,11 @@ class BucketManager:
         name: str = None,
         pinned: bool = False,
         protected: bool = False,
+        source_type: str = "unknown",
+        source_ref: str = "",
+        memory_kind: str = "memory",
+        scope: str = "global",
+        valid_until: str = "",
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -147,7 +154,17 @@ class BucketManager:
             "created": now_iso(),
             "last_active": now_iso(),
             "activation_count": 0,
+            "source_type": source_type or "unknown",
+            "memory_kind": memory_kind or "memory",
+            "scope": scope or "global",
+            "matched_count": 0,
+            "recalled_count": 0,
+            "confirmed_count": 0,
         }
+        if source_ref:
+            metadata["source_ref"] = source_ref
+        if valid_until:
+            metadata["valid_until"] = valid_until
         if pinned:
             metadata["pinned"] = True
         if protected:
@@ -189,6 +206,12 @@ class BucketManager:
             logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
             raise
 
+        self.audit.record(
+            bucket_id,
+            "create",
+            after=self.audit.snapshot_file(str(file_path)),
+            actor="bucket_manager",
+        )
         logger.info(
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
             + (" [PINNED]" if pinned else "") + (" [PROTECTED]" if protected else "")
@@ -244,6 +267,10 @@ class BucketManager:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
+        audit_action = kwargs.pop("_audit_action", "update")
+        audit_actor = kwargs.pop("_audit_actor", "bucket_manager")
+        audit_reason = kwargs.pop("_audit_reason", "")
+        before_snapshot = self.audit.snapshot_file(file_path)
 
         try:
             post = frontmatter.load(file_path)
@@ -282,6 +309,8 @@ class BucketManager:
             post["digested"] = bool(kwargs["digested"])
         if "model_valence" in kwargs:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
+        if "scope" in kwargs:
+            post["scope"] = str(kwargs["scope"]).strip() or "global"
 
         # --- Auto-refresh activation time / 自动刷新激活时间 ---
         post["last_active"] = now_iso()
@@ -303,8 +332,16 @@ class BucketManager:
             post["type"] = "permanent"
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
-            self._move_bucket(file_path, self.permanent_dir, domain)
+            file_path = self._move_bucket(file_path, self.permanent_dir, domain)
 
+        self.audit.record(
+            bucket_id,
+            audit_action,
+            before=before_snapshot,
+            after=self.audit.snapshot_file(file_path),
+            actor=audit_actor,
+            reason=audit_reason,
+        )
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
 
@@ -323,29 +360,145 @@ class BucketManager:
     # Delete bucket
     # 删除桶
     # ---------------------------------------------------------
-    async def delete(self, bucket_id: str) -> bool:
+    async def delete(
+        self,
+        bucket_id: str,
+        actor: str = "bucket_manager",
+        reason: str = "",
+    ) -> bool:
         """
-        Delete a memory bucket file.
-        删除指定的记忆桶文件。
+        Soft-delete a memory bucket file into the hidden Ombre trash.
         """
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
 
+        before_snapshot = self.audit.snapshot_file(file_path)
+        trash_path = self.audit.trash_path(bucket_id)
         try:
-            os.remove(file_path)
+            os.makedirs(trash_path.parent, exist_ok=True)
+            if trash_path.exists():
+                logger.error(f"Refusing delete because trash entry already exists: {trash_path}")
+                return False
+            shutil.move(file_path, str(trash_path))
         except OSError as e:
             logger.error(f"Failed to delete bucket file / 删除桶文件失败: {file_path}: {e}")
             return False
 
-        logger.info(f"Deleted bucket / 删除记忆桶: {bucket_id}")
+        self.audit.record(
+            bucket_id,
+            "delete",
+            before=before_snapshot,
+            after={"relative_path": str(trash_path.relative_to(Path(self.base_dir)))},
+            actor=actor,
+            reason=reason,
+        )
+        logger.info(f"Soft-deleted bucket / 回收记忆桶: {bucket_id}")
+        return True
+
+    async def restore(
+        self,
+        bucket_id: str,
+        actor: str = "bucket_manager",
+        reason: str = "",
+    ) -> bool:
+        """Restore the latest soft-deleted version of a bucket."""
+        if self._find_bucket_file(bucket_id):
+            return False
+        deleted = self.audit.latest_delete(bucket_id)
+        trash_path = self.audit.trash_path(bucket_id)
+        if not deleted or not trash_path.exists():
+            return False
+
+        relative_path = deleted["before"].get("relative_path", f"dynamic/{bucket_id}.md")
+        target = (Path(self.base_dir) / relative_path).resolve()
+        try:
+            target.relative_to(Path(self.base_dir).resolve())
+        except ValueError:
+            return False
+        if target.exists():
+            return False
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(trash_path), str(target))
+        self.audit.record(
+            bucket_id,
+            "restore",
+            before={"relative_path": str(trash_path.relative_to(Path(self.base_dir)))},
+            after=self.audit.snapshot_file(str(target)),
+            actor=actor,
+            reason=reason,
+        )
+        logger.info(f"Restored bucket / 恢复记忆桶: {bucket_id}")
+        return True
+
+    def history(self, bucket_id: str, limit: int = 50) -> list[dict]:
+        """Return newest-first mutation history for a bucket."""
+        return self.audit.history(bucket_id, limit=limit)
+
+    async def list_deleted(self) -> list[dict]:
+        """List buckets currently present in the hidden trash."""
+        deleted = []
+        for path in self.audit.trash_dir.glob("*.md"):
+            bucket = self._load_bucket(str(path))
+            if not bucket:
+                continue
+            history = self.audit.history(bucket["id"], limit=1)
+            deleted.append({
+                "id": bucket["id"],
+                "metadata": bucket["metadata"],
+                "content": bucket["content"],
+                "deleted_at": history[0]["created_at"] if history else "",
+            })
+        deleted.sort(key=lambda item: item["deleted_at"], reverse=True)
+        return deleted
+
+    async def restore_revision(
+        self,
+        bucket_id: str,
+        event_id: int,
+        actor: str = "bucket_manager",
+        reason: str = "",
+    ) -> bool:
+        """Restore a live bucket to the snapshot captured by an audit event."""
+        current_path = self._find_bucket_file(bucket_id)
+        event = self.audit.event(bucket_id, event_id)
+        if not current_path or not event:
+            return False
+        snapshot = event.get("after")
+        if not snapshot or "raw_text" not in snapshot:
+            snapshot = event.get("before")
+        if not snapshot or "raw_text" not in snapshot:
+            return False
+
+        before_snapshot = self.audit.snapshot_file(current_path)
+        target = (Path(self.base_dir) / snapshot["relative_path"]).resolve()
+        try:
+            target.relative_to(Path(self.base_dir).resolve())
+        except ValueError:
+            return False
+        if target != Path(current_path).resolve() and target.exists():
+            return False
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(snapshot["raw_text"], encoding="utf-8")
+        if target != Path(current_path).resolve():
+            Path(current_path).unlink()
+        self.audit.record(
+            bucket_id,
+            "rollback",
+            before=before_snapshot,
+            after=self.audit.snapshot_file(str(target)),
+            actor=actor,
+            reason=reason or f"restore audit event {event_id}",
+        )
         return True
 
     # ---------------------------------------------------------
     # Touch bucket (refresh activation time + increment count)
     # 触碰桶（刷新激活时间 + 累加激活次数）
-    # Called on every recall hit; affects decay score.
-    # 每次检索命中时调用，影响衰减得分。
+    # Called only after explicit confirmation; affects decay score.
+    # 仅在显式确认召回有效后调用，影响衰减得分。
     # ---------------------------------------------------------
     async def touch(self, bucket_id: str) -> None:
         """
@@ -362,6 +515,7 @@ class BucketManager:
             post = frontmatter.load(file_path)
             post["last_active"] = now_iso()
             post["activation_count"] = post.get("activation_count", 0) + 1
+            post["confirmed_count"] = post.get("confirmed_count", 0) + 1
 
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
@@ -372,6 +526,26 @@ class BucketManager:
             await self._time_ripple(bucket_id, current_time)
         except Exception as e:
             logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
+
+    async def record_match(self, bucket_id: str) -> None:
+        """Record a search match without affecting decay or activation."""
+        await self._increment_counter(bucket_id, "matched_count")
+
+    async def record_recall(self, bucket_id: str) -> None:
+        """Record a result returned to the model without affecting heat."""
+        await self._increment_counter(bucket_id, "recalled_count")
+
+    async def _increment_counter(self, bucket_id: str, field: str) -> None:
+        file_path = self._find_bucket_file(bucket_id)
+        if not file_path:
+            return
+        try:
+            post = frontmatter.load(file_path)
+            post[field] = int(post.get(field, 0)) + 1
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
+        except Exception as e:
+            logger.warning(f"Failed to increment {field} for {bucket_id}: {e}")
 
     async def _time_ripple(self, source_id: str, reference_time: datetime, hours: float = 48.0) -> None:
         """
@@ -441,6 +615,7 @@ class BucketManager:
         query: str,
         limit: int = None,
         domain_filter: list[str] = None,
+        scope_filter: str = None,
         query_valence: float = None,
         query_arousal: float = None,
     ) -> list[dict]:
@@ -459,6 +634,14 @@ class BucketManager:
 
         if not all_buckets:
             return []
+
+        if scope_filter:
+            all_buckets = [
+                b for b in all_buckets
+                if b["metadata"].get("scope", "global") == scope_filter
+            ]
+            if not all_buckets:
+                return []
 
         # --- Layer 1: domain pre-filter (fast scope reduction) ---
         # --- 第一层：主题域预筛（快速缩小范围）---
@@ -620,7 +803,11 @@ class BucketManager:
     # List all buckets
     # 列出所有桶
     # ---------------------------------------------------------
-    async def list_all(self, include_archive: bool = False) -> list[dict]:
+    async def list_all(
+        self,
+        include_archive: bool = False,
+        include_expired: bool = False,
+    ) -> list[dict]:
         """
         Recursively walk directories (including domain subdirs), list all buckets.
         递归遍历目录（含域子目录），列出所有记忆桶。
@@ -640,10 +827,24 @@ class BucketManager:
                         continue
                     file_path = os.path.join(root, filename)
                     bucket = self._load_bucket(file_path)
-                    if bucket:
+                    if bucket and (
+                        include_expired
+                        or not self._is_expired(bucket.get("metadata", {}))
+                    ):
                         buckets.append(bucket)
 
         return buckets
+
+    @staticmethod
+    def _is_expired(metadata: dict) -> bool:
+        """Return True when a memory's explicit validity window has ended."""
+        valid_until = metadata.get("valid_until", "")
+        if not valid_until:
+            return False
+        try:
+            return datetime.fromisoformat(str(valid_until)) <= datetime.now()
+        except (ValueError, TypeError):
+            return False
 
     # ---------------------------------------------------------
     # Statistics (counts per category + total size)
@@ -701,6 +902,7 @@ class BucketManager:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
+        before_snapshot = self.audit.snapshot_file(file_path)
 
         try:
             # Read once, get domain info and update type / 一次性读取
@@ -726,6 +928,14 @@ class BucketManager:
             )
             return False
 
+        self.audit.record(
+            bucket_id,
+            "archive",
+            before=before_snapshot,
+            after=self.audit.snapshot_file(str(dest)),
+            actor="decay_engine",
+            reason="decay archive",
+        )
         logger.info(f"Archived bucket / 归档记忆桶: {bucket_id} → archive/{primary_domain}/")
         return True
 

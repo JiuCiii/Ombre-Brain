@@ -315,9 +315,10 @@ breath(query="今天很累")
 | `breath` | 浮现或检索记忆。无参数=推送未解决记忆；有参数=关键词+向量语义双通道检索。支持 domain/valence/arousal 过滤 / Surface or search memories. No args = surface unresolved; with query = keyword + vector dual-channel search. Supports domain/valence/arousal filters |
 | `hold` | 存储单条记忆，自动打标+合并相似桶+生成 embedding。`feel=True` 写模型自己的感受 / Store a single memory with auto-tagging, merging, and embedding. `feel=True` for model's own reflections |
 | `grow` | 日记归档，自动拆分长内容为多个记忆桶，每个桶自动生成 embedding / Diary digest, auto-split into multiple buckets with embeddings |
-| `trace` | 修改元数据、标记已解决、删除 / Modify metadata, mark resolved, delete |
+| `trace` | 修改元数据、标记已解决、软删除与恢复 / Modify metadata, mark resolved, soft-delete and restore |
 | `pulse` | 系统状态 + 所有记忆桶列表 / System status + bucket listing |
-| `dream` | 对话开头自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve / Self-reflection at conversation start |
+| `dream` | 对话开头自省消化；洞察先生成待审核提案 / Self-reflection with reviewable insight proposals |
+| `review_proposals` | 展示、批准或拒绝合并与 Dream 洞察提案 / Review merge and Dream insight proposals |
 
 ## 安装 / Setup
 
@@ -429,6 +430,16 @@ All parameters in `config.yaml` (copy from `config.example.yaml`). Key ones:
 | `decay.lambda` | 衰减速率，越大越快忘 / Decay rate | `0.05` |
 | `decay.threshold` | 归档阈值 / Archive threshold | `0.3` |
 | `merge_threshold` | 合并相似度阈值 (0-100) / Merge similarity | `75` |
+| `merge_mode` | `proposal` 安全审核；`direct` 兼容旧版立即合并 | `proposal` |
+
+旧记忆升级前可先运行安全 dry-run：
+
+```bash
+python migrate_safety_metadata.py
+python migrate_safety_metadata.py --apply
+```
+
+第一条只报告需要迁移的桶；第二条补齐安全元数据，并为每次修改写入审计账本。
 
 敏感配置用环境变量：
 Sensitive config via env vars:
@@ -511,7 +522,8 @@ $$emotion\_weight = base + arousal \times arousal\_boost$$
 ### 参数说明 / Parameters
 
 - `importance`: 1-10，记忆重要性 / memory importance
-- `activation_count`: 被检索的次数，越常被想起衰减越慢 / retrieval count; more recalls = slower decay
+- `matched_count` / `recalled_count`: 被检索命中和实际返回的次数，不影响衰减
+- `confirmed_count` / `activation_count`: 被明确确认有用的次数，越常被确认衰减越慢
 - `days`: 距上次激活的天数 / days since last activation
 - `arousal`: 唤醒度，越强烈的记忆越难忘 / arousal; intense memories are harder to forget
 - `λ` (decay_lambda): 衰减速率，默认 0.05 / decay rate, default 0.05
@@ -519,7 +531,7 @@ $$emotion\_weight = base + arousal \times arousal\_boost$$
 ## Dreaming 与 Feel / Dreaming & Feel
 
 ### Dreaming — 做梦
-每次新对话开始时，Claude 会自动执行 `dream()`——读取最近的记忆桶，用第一人称思考：哪些事还有重量？哪些可以放下了？
+每次新对话开始时，Claude 会执行 `dream()` 读取最近记忆。产生的洞察先进入审核提案，不直接修改事实记忆。
 
 At the start of each conversation, Claude runs `dream()` — reads recent memory buckets and reflects in first person: what still carries weight? What can be let go?
 

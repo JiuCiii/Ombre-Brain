@@ -43,6 +43,7 @@ import secrets
 import time
 import json as _json_lib
 import httpx
+from datetime import datetime, timedelta
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -56,6 +57,7 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
+from proposal_store import ProposalStore
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -102,6 +104,7 @@ bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket 
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+proposal_store = ProposalStore(config["buckets_dir"])
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -324,7 +327,13 @@ async def health_check(request):
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
     try:
+        scope = request.query_params.get("scope", "").strip()
         all_buckets = await bucket_mgr.list_all(include_archive=False)
+        if scope:
+            all_buckets = [
+                b for b in all_buckets
+                if b["metadata"].get("scope", "global") == scope
+            ]
         # pinned
         pinned = [b for b in all_buckets if b["metadata"].get("pinned") or b["metadata"].get("protected")]
         # top 2 unresolved by score
@@ -381,12 +390,14 @@ async def breath_hook(request):
 async def dream_hook(request):
     from starlette.responses import PlainTextResponse
     try:
+        scope = request.query_params.get("scope", "").strip()
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         candidates = [
             b for b in all_buckets
             if b["metadata"].get("type") not in ("permanent", "feel")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
+            and (not scope or b["metadata"].get("scope", "global") == scope)
         ]
         candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
         recent = candidates[:10]
@@ -426,6 +437,8 @@ async def _merge_or_create(
     valence: float,
     arousal: float,
     name: str = "",
+    source_type: str = "model_write",
+    scope: str = "global",
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -434,7 +447,12 @@ async def _merge_or_create(
     返回 (桶ID或名称, 是否合并)。
     """
     try:
-        existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None)
+        existing = await bucket_mgr.search(
+            content,
+            limit=1,
+            domain_filter=domain or None,
+            scope_filter=scope,
+        )
     except Exception as e:
         logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
         existing = []
@@ -443,28 +461,66 @@ async def _merge_or_create(
         bucket = existing[0]
         # --- Never merge into pinned/protected buckets ---
         # --- 不合并到钉选/保护桶 ---
-        if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
+        if not (
+            bucket["metadata"].get("pinned")
+            or bucket["metadata"].get("protected")
+            or bucket["metadata"].get("type") in ("feel", "permanent")
+        ):
             try:
                 merged = await dehydrator.merge(bucket["content"], content)
                 old_v = bucket["metadata"].get("valence", 0.5)
                 old_a = bucket["metadata"].get("arousal", 0.3)
                 merged_valence = round((old_v + valence) / 2, 2)
                 merged_arousal = round((old_a + arousal) / 2, 2)
-                await bucket_mgr.update(
-                    bucket["id"],
-                    content=merged,
-                    tags=list(set(bucket["metadata"].get("tags", []) + tags)),
-                    importance=max(bucket["metadata"].get("importance", 5), importance),
-                    domain=list(set(bucket["metadata"].get("domain", []) + domain)),
-                    valence=merged_valence,
-                    arousal=merged_arousal,
+                merged_fields = {
+                    "content": merged,
+                    "tags": list(set(bucket["metadata"].get("tags", []) + tags)),
+                    "importance": max(bucket["metadata"].get("importance", 5), importance),
+                    "domain": list(set(bucket["metadata"].get("domain", []) + domain)),
+                    "valence": merged_valence,
+                    "arousal": merged_arousal,
+                }
+                if config.get("merge_mode", "proposal") == "direct":
+                    await bucket_mgr.update(
+                        bucket["id"],
+                        **merged_fields,
+                        _audit_action="merge",
+                        _audit_actor="hold_or_grow",
+                        _audit_reason=f"automatic similarity merge from {source_type}",
+                    )
+                    try:
+                        await embedding_engine.generate_and_store(bucket["id"], merged)
+                    except Exception:
+                        pass
+                    return bucket["metadata"].get("name", bucket["id"]), True
+
+                source_id = await bucket_mgr.create(
+                    content=content,
+                    tags=tags,
+                    importance=importance,
+                    domain=domain,
+                    valence=valence,
+                    arousal=arousal,
+                    name=name or None,
+                    source_type=source_type,
+                    scope=scope,
                 )
-                # --- Update embedding after merge ---
                 try:
-                    await embedding_engine.generate_and_store(bucket["id"], merged)
+                    await embedding_engine.generate_and_store(source_id, content)
                 except Exception:
                     pass
-                return bucket["metadata"].get("name", bucket["id"]), True
+                proposal_id = proposal_store.create(
+                    "merge",
+                    f"合并 {source_id} → {bucket['id']}，相似分 {bucket.get('score', 0)}",
+                    {
+                        "source_bucket_id": source_id,
+                        "target_bucket_id": bucket["id"],
+                        "score": bucket.get("score", 0),
+                        "merged_fields": merged_fields,
+                    },
+                    scope=scope,
+                )
+                return f"{source_id} 待审核合并:{proposal_id}", False
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
 
@@ -476,6 +532,8 @@ async def _merge_or_create(
         valence=valence,
         arousal=arousal,
         name=name or None,
+        source_type=source_type,
+        scope=scope,
     )
     # --- Generate embedding for new bucket ---
     try:
@@ -503,6 +561,7 @@ async def breath(
     arousal: float = -1,
     max_results: int = 20,
     importance_min: int = -1,
+    scope: str = "",
 ) -> str:
     """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。"""
     await decay_engine.ensure_started()
@@ -520,6 +579,7 @@ async def breath(
             b for b in all_buckets
             if int(b["metadata"].get("importance", 0)) >= importance_min
             and b["metadata"].get("type") not in ("feel",)
+            and (not scope or b["metadata"].get("scope", "global") == scope)
         ]
         filtered.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
         filtered = filtered[:20]
@@ -556,7 +616,8 @@ async def breath(
         # --- 钉选桶：作为核心准则，始终浮现 ---
         pinned_buckets = [
             b for b in all_buckets
-            if b["metadata"].get("pinned") or b["metadata"].get("protected")
+            if (b["metadata"].get("pinned") or b["metadata"].get("protected"))
+            and (not scope or b["metadata"].get("scope", "global") == scope)
         ]
         pinned_results = []
         for b in pinned_buckets:
@@ -576,6 +637,7 @@ async def breath(
             and b["metadata"].get("type") not in ("permanent", "feel")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
+            and (not scope or b["metadata"].get("scope", "global") == scope)
         ]
 
         logger.info(
@@ -659,7 +721,11 @@ async def breath(
     if domain.strip().lower() == "feel":
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
-            feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
+            feels = [
+                b for b in all_buckets
+                if b["metadata"].get("type") == "feel"
+                and (not scope or b["metadata"].get("scope", "global") == scope)
+            ]
             feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
             if not feels:
                 return "没有留下过 feel。"
@@ -686,6 +752,7 @@ async def breath(
             query,
             limit=max(max_results, 20),
             domain_filter=domain_filter,
+            scope_filter=scope or None,
             query_valence=q_valence,
             query_arousal=q_arousal,
         )
@@ -696,7 +763,6 @@ async def breath(
     # --- Exclude pinned/protected from search results (they surface in surfacing mode) ---
     # --- 搜索模式排除钉选桶（它们在浮现模式中始终可见）---
     matches = [b for b in matches if not (b["metadata"].get("pinned") or b["metadata"].get("protected"))]
-
     # --- Vector similarity channel: find semantically related buckets ---
     # --- 向量相似度通道：找到语义相关的桶 ---
     matched_ids = {b["id"] for b in matches}
@@ -705,13 +771,20 @@ async def breath(
         for bucket_id, sim_score in vector_results:
             if bucket_id not in matched_ids and sim_score > 0.5:
                 bucket = await bucket_mgr.get(bucket_id)
-                if bucket and not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
+                if (
+                    bucket
+                    and (not scope or bucket["metadata"].get("scope", "global") == scope)
+                    and not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected"))
+                ):
                     bucket["score"] = round(sim_score * 100, 2)
                     bucket["vector_match"] = True
                     matches.append(bucket)
                     matched_ids.add(bucket_id)
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
+
+    for bucket in matches:
+        await bucket_mgr.record_match(bucket["id"])
 
     results = []
     token_used = 0
@@ -730,7 +803,7 @@ async def breath(
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
                 break
-            await bucket_mgr.touch(bucket["id"])
+            await bucket_mgr.record_recall(bucket["id"])
             if bucket.get("vector_match"):
                 summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
             else:
@@ -751,6 +824,7 @@ async def breath(
                 b for b in all_buckets
                 if b["id"] not in matched_ids
                 and decay_engine.calculate_score(b["metadata"]) < 2.0
+                and (not scope or b["metadata"].get("scope", "global") == scope)
             ]
             if low_weight:
                 drifted = random.sample(low_weight, min(random.randint(1, 3), len(low_weight)))
@@ -785,6 +859,7 @@ async def hold(
     feel: bool = False,
     source_bucket: str = "",    valence: float = -1,
     arousal: float = -1,
+    scope: str = "global",
 ) -> str:
     """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。"""
     await decay_engine.ensure_started()
@@ -811,6 +886,10 @@ async def hold(
             arousal=feel_arousal,
             name=None,
             bucket_type="feel",
+            source_type="model_reflection",
+            source_ref=source_bucket.strip(),
+            memory_kind="inference",
+            scope=scope,
         )
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
@@ -864,6 +943,8 @@ async def hold(
             name=suggested_name or None,
             bucket_type="permanent",
             pinned=True,
+            source_type="hold",
+            scope=scope,
         )
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
@@ -880,6 +961,8 @@ async def hold(
         valence=final_valence,
         arousal=final_arousal,
         name=suggested_name,
+        source_type="hold",
+        scope=scope,
     )
 
     action = "合并→" if is_merged else "新建→"
@@ -891,7 +974,7 @@ async def hold(
 # 工具 3：grow — 生长，一天的碎片长成记忆
 # =============================================================
 @mcp.tool()
-async def grow(content: str) -> str:
+async def grow(content: str, scope: str = "global") -> str:
     """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。"""
     await decay_engine.ensure_started()
 
@@ -921,6 +1004,8 @@ async def grow(content: str) -> str:
             valence=analysis.get("valence", 0.5),
             arousal=analysis.get("arousal", 0.3),
             name=analysis.get("suggested_name", ""),
+            source_type="grow",
+            scope=scope,
         )
         action = "合并" if is_merged else "新建"
         return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
@@ -951,6 +1036,8 @@ async def grow(content: str) -> str:
                 valence=item.get("valence", 0.5),
                 arousal=item.get("arousal", 0.3),
                 name=item.get("name", ""),
+                source_type="grow",
+                scope=scope,
             )
 
             if is_merged:
@@ -989,15 +1076,62 @@ async def trace(
     digested: int = -1,
     content: str = "",
     delete: bool = False,
+    restore: bool = False,
+    history: bool = False,
+    revision: int = -1,
+    scope: str = "",
+    confirm: bool = False,
 ) -> str:
-    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。"""
+    """修改记忆。delete=True软删除,restore=True恢复,history=True看历史,revision=事件ID回滚。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
 
+    if history:
+        events = bucket_mgr.history(bucket_id, limit=20)
+        if not events:
+            return f"未找到记忆历史: {bucket_id}"
+        return "\n".join(
+            f"{event['event_id']} | {event['created_at']} | {event['action']} | "
+            f"{event['actor']} | {event['reason']}"
+            for event in events
+        )
+
+    if confirm:
+        if not await bucket_mgr.get(bucket_id):
+            return f"未找到记忆桶: {bucket_id}"
+        await bucket_mgr.touch(bucket_id)
+        return f"已确认召回记忆桶: {bucket_id}"
+
+    if revision >= 0:
+        success = await bucket_mgr.restore_revision(
+            bucket_id,
+            revision,
+            actor="trace",
+            reason=f"explicit rollback to event {revision}",
+        )
+        if success:
+            bucket = await bucket_mgr.get(bucket_id)
+            if bucket:
+                try:
+                    await embedding_engine.generate_and_store(bucket_id, bucket["content"])
+                except Exception:
+                    pass
+        return f"已回滚记忆桶: {bucket_id} → {revision}" if success else f"无法回滚记忆桶: {bucket_id}"
+    if restore:
+        success = await bucket_mgr.restore(bucket_id, actor="trace", reason="explicit restore")
+        if success:
+            bucket = await bucket_mgr.get(bucket_id)
+            if bucket:
+                try:
+                    await embedding_engine.generate_and_store(bucket_id, bucket["content"])
+                except Exception:
+                    pass
+        return f"已恢复记忆桶: {bucket_id}" if success else f"无法恢复记忆桶: {bucket_id}"
+
     # --- Delete mode / 删除模式 ---
     if delete:
-        success = await bucket_mgr.delete(bucket_id)
+        success = await bucket_mgr.delete(bucket_id, actor="trace", reason="explicit delete")
         if success:
             embedding_engine.delete_embedding(bucket_id)
         return f"已遗忘记忆桶: {bucket_id}" if success else f"未找到记忆桶: {bucket_id}"
@@ -1030,11 +1164,19 @@ async def trace(
         updates["digested"] = bool(digested)
     if content:
         updates["content"] = content
+    if scope:
+        updates["scope"] = scope
 
     if not updates:
         return "没有任何字段需要修改。"
 
-    success = await bucket_mgr.update(bucket_id, **updates)
+    success = await bucket_mgr.update(
+        bucket_id,
+        _audit_action="trace_update",
+        _audit_actor="trace",
+        _audit_reason="explicit trace update",
+        **updates,
+    )
     if not success:
         return f"修改失败: {bucket_id}"
 
@@ -1139,9 +1281,23 @@ async def pulse(include_archive: bool = False) -> str:
 # Claude then decides: resolve some, write feels, or do nothing.
 # =============================================================
 @mcp.tool()
-async def dream() -> str:
-    """做梦——读取最近新增的记忆桶,供你自省。读完后可以trace(resolved=1)放下,或hold(feel=True)写感受。"""
+async def dream(scope: str = "", insight: str = "", source_buckets: str = "") -> str:
+    """读取近期记忆供自省；传 insight 时生成待审核洞察提案，不直接写入事实。"""
     await decay_engine.ensure_started()
+
+    if insight.strip():
+        source_ids = [item.strip() for item in source_buckets.split(",") if item.strip()]
+        proposal_id = proposal_store.create(
+            "dream_insight",
+            insight.strip()[:160],
+            {
+                "content": insight.strip(),
+                "source_bucket_ids": source_ids,
+                "valid_until": (datetime.now() + timedelta(days=30)).isoformat(timespec="seconds"),
+            },
+            scope=scope or "global",
+        )
+        return f"已生成 Dream 洞察提案: {proposal_id}"
 
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -1155,6 +1311,7 @@ async def dream() -> str:
         if b["metadata"].get("type") not in ("permanent", "feel")
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
+        and (not scope or b["metadata"].get("scope", "global") == scope)
     ]
 
     # --- Sort by creation time desc, take top 10 ---
@@ -1186,8 +1343,8 @@ async def dream() -> str:
         "- 这些东西里有什么在你这里留下了重量？\n"
         "- 有什么还没想清楚？\n"
         "- 有什么可以放下了？\n"
-        "想完之后：值得放下的用 trace(bucket_id, resolved=1)；\n"
-        "有沉淀的用 hold(content=\"...\", feel=True, source_bucket=\"bucket_id\", valence=你的感受) 写下来。\n"
+        "想完之后：有沉淀时用 dream(insight=\"...\", source_buckets=\"id1,id2\") 生成待审核提案。\n"
+        "不要仅因为 Dream 推测就直接修改、resolve 或删除事实记忆。\n"
         "valence 是你对这段记忆的感受，不是事件本身的情绪。\n"
         "没有沉淀就不写，不强迫产出。\n"
     )
@@ -1259,10 +1416,207 @@ async def dream() -> str:
     return final_text
 
 
+async def _apply_proposal(proposal_id: str, reviewer: str, note: str = "") -> tuple[bool, str]:
+    proposal = proposal_store.get(proposal_id)
+    if not proposal or proposal["status"] != "pending":
+        return False, "提案不存在或已处理"
+
+    payload = proposal["payload"]
+    if proposal["proposal_type"] == "merge":
+        source_id = payload["source_bucket_id"]
+        target_id = payload["target_bucket_id"]
+        source = await bucket_mgr.get(source_id)
+        target = await bucket_mgr.get(target_id)
+        if not source or not target:
+            return False, "源记忆或目标记忆不存在"
+        if source["metadata"].get("scope", "global") != target["metadata"].get("scope", "global"):
+            return False, "拒绝跨作用域合并"
+        deleted = await bucket_mgr.delete(
+            source_id,
+            actor=reviewer,
+            reason=f"merged by approved proposal {proposal_id}",
+        )
+        if not deleted:
+            return False, "源记忆未能安全回收，目标未修改"
+        try:
+            updated = await bucket_mgr.update(
+                target_id,
+                **payload["merged_fields"],
+                _audit_action="merge",
+                _audit_actor=reviewer,
+                _audit_reason=f"approved proposal {proposal_id}",
+            )
+            if not updated:
+                raise RuntimeError("target update returned false")
+            embedding_engine.delete_embedding(source_id)
+            try:
+                await embedding_engine.generate_and_store(target_id, payload["merged_fields"]["content"])
+            except Exception:
+                pass
+        except Exception as e:
+            await bucket_mgr.restore(
+                source_id,
+                actor="proposal_rollback",
+                reason=f"restore after failed proposal {proposal_id}",
+            )
+            return False, f"目标更新失败，源记忆已恢复: {e}"
+    elif proposal["proposal_type"] == "dream_insight":
+        source_ids = payload.get("source_bucket_ids", [])
+        bucket_id = await bucket_mgr.create(
+            content=payload["content"],
+            tags=[],
+            importance=5,
+            domain=[],
+            valence=0.5,
+            arousal=0.3,
+            bucket_type="feel",
+            source_type="dream_approved",
+            source_ref=",".join(source_ids),
+            memory_kind="inference",
+            scope=proposal["scope"],
+            valid_until=payload.get("valid_until", ""),
+        )
+        try:
+            await embedding_engine.generate_and_store(bucket_id, payload["content"])
+        except Exception:
+            pass
+    else:
+        return False, f"不支持的提案类型: {proposal['proposal_type']}"
+
+    if not proposal_store.resolve(proposal_id, "approved", reviewer, note):
+        return False, "提案已执行，但状态更新失败；请人工检查"
+    return True, "已批准并执行"
+
+
+@mcp.tool()
+async def review_proposals(
+    proposal_id: str = "",
+    action: str = "list",
+    scope: str = "",
+    note: str = "",
+) -> str:
+    """查看或审核高风险变更提案。action=list/show/approve/reject。"""
+    action = action.strip().lower()
+    if action == "list":
+        proposals = proposal_store.list(status="pending", scope=scope, limit=50)
+        if not proposals:
+            return "没有待审核提案。"
+        return "\n".join(
+            f"{p['proposal_id']} | {p['proposal_type']} | {p['scope']} | {p['summary']}"
+            for p in proposals
+        )
+    if not proposal_id:
+        return "请提供 proposal_id。"
+    if action == "show":
+        proposal = proposal_store.get(proposal_id)
+        if not proposal:
+            return "未找到提案。"
+        detail = {
+            "proposal_id": proposal["proposal_id"],
+            "type": proposal["proposal_type"],
+            "status": proposal["status"],
+            "scope": proposal["scope"],
+            "summary": proposal["summary"],
+            "payload": proposal["payload"],
+        }
+        if proposal["proposal_type"] == "merge":
+            source = await bucket_mgr.get(proposal["payload"]["source_bucket_id"])
+            target = await bucket_mgr.get(proposal["payload"]["target_bucket_id"])
+            detail["source_content"] = source["content"] if source else None
+            detail["target_content"] = target["content"] if target else None
+        return _json_lib.dumps(detail, ensure_ascii=False, indent=2)
+    if action == "approve":
+        success, message = await _apply_proposal(proposal_id, reviewer="review_proposals", note=note)
+        return message if success else f"批准失败: {message}"
+    if action == "reject":
+        success = proposal_store.resolve(proposal_id, "rejected", "review_proposals", note)
+        return "已拒绝提案，现有记忆保持不变。" if success else "拒绝失败：提案不存在或已处理。"
+    return "action 仅支持 list、show、approve、reject。"
+
+
 # =============================================================
 # Dashboard API endpoints (for lightweight Web UI)
 # 仪表板 API（轻量 Web UI 用）
 # =============================================================
+@mcp.custom_route("/api/proposals", methods=["GET"])
+async def api_proposals(request):
+    """List review proposals for the Dashboard."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    status = request.query_params.get("status", "pending")
+    scope = request.query_params.get("scope", "")
+    return JSONResponse({"proposals": proposal_store.list(status=status, scope=scope, limit=100)})
+
+
+@mcp.custom_route("/api/proposals/{proposal_id}", methods=["GET"])
+async def api_proposal_detail(request):
+    """Return one proposal with source/target content for review."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    proposal = proposal_store.get(request.path_params["proposal_id"])
+    if not proposal:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if proposal["proposal_type"] == "merge":
+        source = await bucket_mgr.get(proposal["payload"]["source_bucket_id"])
+        target = await bucket_mgr.get(proposal["payload"]["target_bucket_id"])
+        proposal["source_content"] = source["content"] if source else None
+        proposal["target_content"] = target["content"] if target else None
+    return JSONResponse(proposal)
+
+
+@mcp.custom_route("/api/proposals/review", methods=["POST"])
+async def api_proposals_review(request):
+    """Approve or reject one review proposal."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    proposal_id = str(body.get("proposal_id", "")).strip()
+    action = str(body.get("action", "")).strip().lower()
+    note = str(body.get("note", "")).strip()
+    if not proposal_id or action not in ("approve", "reject"):
+        return JSONResponse({"error": "proposal_id and action=approve/reject required"}, status_code=400)
+    if action == "approve":
+        success, message = await _apply_proposal(proposal_id, reviewer="dashboard", note=note)
+    else:
+        success = proposal_store.resolve(proposal_id, "rejected", "dashboard", note)
+        message = "已拒绝提案，现有记忆保持不变。" if success else "提案不存在或已处理。"
+    return JSONResponse({"ok": success, "message": message}, status_code=200 if success else 409)
+
+
+@mcp.custom_route("/api/trash", methods=["GET"])
+async def api_trash(request):
+    """List soft-deleted buckets."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    deleted = await bucket_mgr.list_deleted()
+    return JSONResponse({"buckets": deleted})
+
+
+@mcp.custom_route("/api/trash/{bucket_id}/restore", methods=["POST"])
+async def api_trash_restore(request):
+    """Restore one soft-deleted bucket."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    success = await bucket_mgr.restore(bucket_id, actor="dashboard", reason="dashboard restore")
+    if success:
+        bucket = await bucket_mgr.get(bucket_id)
+        if bucket:
+            try:
+                await embedding_engine.generate_and_store(bucket_id, bucket["content"])
+            except Exception:
+                pass
+    return JSONResponse({"ok": success}, status_code=200 if success else 409)
+
+
 @mcp.custom_route("/api/buckets", methods=["GET"])
 async def api_buckets(request):
     """List all buckets with metadata (no content for efficiency)."""
@@ -1316,6 +1670,53 @@ async def api_bucket_detail(request):
         "content": strip_wikilinks(bucket.get("content", "")),
         "score": decay_engine.calculate_score(meta),
     })
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}/history", methods=["GET"])
+async def api_bucket_history(request):
+    """Return audit history without raw snapshots."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    history = bucket_mgr.history(request.path_params["bucket_id"], limit=100)
+    return JSONResponse({"events": [
+        {
+            "event_id": event["event_id"],
+            "action": event["action"],
+            "actor": event["actor"],
+            "reason": event["reason"],
+            "created_at": event["created_at"],
+        }
+        for event in history
+    ]})
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}/rollback", methods=["POST"])
+async def api_bucket_rollback(request):
+    """Rollback a live bucket to one audit event."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        body = await request.json()
+        event_id = int(body.get("event_id"))
+    except Exception:
+        return JSONResponse({"error": "valid event_id required"}, status_code=400)
+    bucket_id = request.path_params["bucket_id"]
+    success = await bucket_mgr.restore_revision(
+        bucket_id,
+        event_id,
+        actor="dashboard",
+        reason=f"dashboard rollback to event {event_id}",
+    )
+    if success:
+        bucket = await bucket_mgr.get(bucket_id)
+        if bucket:
+            try:
+                await embedding_engine.generate_and_store(bucket_id, bucket["content"])
+            except Exception:
+                pass
+    return JSONResponse({"ok": success}, status_code=200 if success else 409)
 
 
 @mcp.custom_route("/api/search", methods=["GET"])
@@ -1866,9 +2267,9 @@ async def api_import_review(request):
             elif action == "noise":
                 await bucket_mgr.update(bid, resolved=True, importance=1)
             elif action == "delete":
-                file_path = bucket_mgr._find_bucket_file(bid)
-                if file_path:
-                    os.remove(file_path)
+                deleted = await bucket_mgr.delete(bid, actor="dashboard", reason="import review delete")
+                if deleted:
+                    embedding_engine.delete_embedding(bid)
             applied += 1
         except Exception as e:
             logger.warning(f"Review action failed for {bid}: {e}")
