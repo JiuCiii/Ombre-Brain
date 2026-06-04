@@ -113,9 +113,9 @@ hold(content="用户拿到实习 offer，情绪激动", importance=7)
 7. **合并检测**：`_merge_or_create(content, tags, importance=7, domain, valence, arousal, name)`
    - `bucket_mgr.search(content, limit=1, domain_filter=domain)` — 搜索最相似的桶
    - 若最高分 > `config["merge_threshold"]`（默认 75）且该桶非 pinned/protected：
-     - `dehydrator.merge(old_content, new_content)` → `_api_merge()` → LLM 融合
-     - `bucket_mgr.update(bucket_id, content=merged, tags=union, importance=max, domain=union, valence=avg, arousal=avg)`
-     - `embedding_engine.generate_and_store(bucket_id, merged_content)` 更新向量
+     - 默认 `merge_mode=proposal`：保存新内容为独立源桶，生成待审核合并提案，不修改目标桶
+     - 批准后更新目标桶并软删除源桶；拒绝时两个桶均保持不变
+     - `merge_mode=direct` 仅用于兼容旧版立即合并行为
      - 返回 `(bucket_name, True)`
    - 否则：
      - `bucket_mgr.create(content, tags, importance=7, domain, valence, arousal, name)` → 写 `.md` 文件到 `dynamic/<主题域>/` 目录
@@ -275,9 +275,14 @@ trace(bucket_id="abc123", delete=True)
 ```
 
 **系统内部**：
-1. `bucket_mgr.delete("abc123")` → `_find_bucket_file()` 定位文件 → `os.remove(file_path)`
+1. `bucket_mgr.delete("abc123")` → `_find_bucket_file()` 定位文件 → 移入 `.ombre/trash/`
 2. `embedding_engine.delete_embedding("abc123")` → SQLite `DELETE WHERE bucket_id=?`
 3. 返回：`"已遗忘记忆桶: abc123"`
+
+删除前后的完整快照会写入 `.ombre/audit.db`。使用
+`trace(bucket_id="abc123", restore=True)` 可恢复最近一次软删除。
+`trace(bucket_id="abc123", history=True)` 可查询事件 ID，
+`trace(bucket_id="abc123", revision=事件ID)` 可回滚到对应历史快照。
 
 ---
 
@@ -337,8 +342,8 @@ trace(bucket_id="abc123", delete=True)
 6. 返回标准 header 说明（引导 Claude 自省）+ 记忆列表 + 连接提示 + 结晶提示
 
 **Claude 后续行为**（根据 CLAUDE_PROMPT 引导）：
-- `trace(bucket_id, resolved=1)` 放下可以放下的
-- `hold(content="...", feel=True, source_bucket="xxx", valence=0.6)` 写感受
+- `dream(insight="...", source_buckets="id1,id2")` 创建待审核洞察提案
+- 不因 Dream 推测直接修改、resolve 或删除事实记忆
 - 无沉淀则不操作
 
 ---
@@ -625,6 +630,9 @@ feel 桶自身:
 - `dream()` 连接提示（best_sim > 0.5）+ 结晶提示（feel 相似度 > 0.7 × ≥2 个）
 - 所有 `/api/*` Dashboard 路由均受 `_require_auth` 保护
 - `trace(delete=True)` 同步调用 `embedding_engine.delete_embedding()`
+- 创建、更新、合并、归档、软删除和恢复均写入审计账本
+- 普通检索只增加 `matched_count` / `recalled_count`，不刷新衰减；显式 `trace(confirm=True)` 才增加热度
+- `scope` 作用域为严格隔离，指定后不会回退到全局桶
 - `grow()` 单条失败 `try/except` 隔离，标注 `⚠️条目名`，其他条继续
 
 ---

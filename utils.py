@@ -33,6 +33,7 @@ def load_config(config_path: str = None) -> dict:
         "log_level": "INFO",
         "buckets_dir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "buckets"),
         "merge_threshold": 75,
+        "merge_mode": "proposal",
         "dehydration": {
             "model": "deepseek-chat",
             "base_url": "https://api.deepseek.com/v1",

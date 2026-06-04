@@ -79,13 +79,15 @@
 | `breath` | query, max_tokens, domain, valence, arousal, max_results, **importance_min** | 检索/浮现记忆 |
 | `hold` | content, tags, importance, pinned, feel, source_bucket, valence, arousal | 存储记忆 |
 | `grow` | content | 日记拆分归档 |
-| `trace` | bucket_id, name, domain, valence, arousal, importance, tags, resolved, pinned, digested, content, delete | 修改元数据/内容/删除 |
+| `trace` | bucket_id, name, domain, valence, arousal, importance, tags, resolved, pinned, digested, content, delete, restore, history, revision | 修改元数据/内容/软删除/恢复/回滚 |
 | `pulse` | include_archive | 系统状态 |
-| `dream` | （无） | 做梦自省 |
+| `dream` | scope, insight, source_buckets | 做梦自省与洞察提案 |
+| `review_proposals` | proposal_id, action, scope, note | 展示/批准/拒绝提案 |
 
 **工具详细行为**
 
 **`breath`** — 三种模式：
+- `scope` 非空时仅召回完全相同作用域的桶，不回退全局
 - **浮现模式**（无 query）：无参调用，按衰减引擎活跃度排序返回 top 记忆，钉选桶始终展示；冷启动检测（`activation_count==0 && importance>=8`）的桶最多 2 个插入最前，再 Top-1 固定 + Top-20 随机打乱
 - **检索模式**（有 query）：关键词 + 向量双通道搜索，四维评分（topic×4 + emotion×2 + time×2.5 + importance×1），阈值过滤
 - **Feel 检索**（`domain="feel"`）：特殊通道，按创建时间倒序返回所有 feel 类型桶，不走评分逻辑
@@ -100,12 +102,16 @@
 - 返回最近 10 条 dynamic 桶摘要 + 自省引导词
 - 检测 feel 结晶化：≥3 条相似 feel（embedding 相似度>0.7）→ 提示升级为钉选准则
 - 检测未消化记忆：列出 `digested=False` 的桶供模型反思
+- `insight` 非空时只创建待审核提案；批准后保存为带 30 天有效期的 inference
 
 **`trace`** — 记忆编辑：
 - 修改任意元数据字段（name/domain/valence/arousal/importance/tags/resolved/pinned）
 - `digested=0/1`：隐藏/取消隐藏记忆（控制是否在 dream 中出现）
 - `content="..."`：替换正文内容并重新生成 embedding
-- `delete=True`：删除桶文件
+- `delete=True`：将桶移入 `.ombre/trash/`，删除 embedding，并写入审计账本
+- `restore=True`：恢复最近一次软删除的桶并重新生成 embedding
+- `history=True`：列出最近审计事件；`revision=事件ID`：回滚到对应快照
+- `confirm=True`：确认本次召回有效，增加 `confirmed_count` 与激活热度
 
 **`grow`** — 日记拆分：
 - 大段日记文本 → LLM 拆为 2~6 条独立记忆 → 每条走 hold 普通模式流程

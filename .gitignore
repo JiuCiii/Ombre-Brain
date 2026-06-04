@@ -16,6 +16,7 @@ backup_*/
 *.db
 import_state.json
 data/
+.tmp-*/
 tests/integration/
 tests/regression/
 tests/unit/

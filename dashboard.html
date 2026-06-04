@@ -614,6 +614,7 @@
   <div class="tab active" data-tab="list">记忆桶</div>
   <div class="tab" data-tab="breath">Breath 模拟</div>
   <div class="tab" data-tab="network">记忆网络</div>
+  <div class="tab" data-tab="review">审核与恢复</div>
   <div class="tab" data-tab="config">配置</div>
   <div class="tab" data-tab="import">导入</div>
   <div class="tab" data-tab="settings">设置</div>
@@ -663,6 +664,25 @@
     <div class="legend-item"><span class="legend-dot" style="background:#B0A590"></span> archived</div>
   </div>
   <canvas id="network-canvas"></canvas>
+</div>
+
+<div class="content" id="review-view" style="display:none">
+  <div style="max-width:980px;margin:0 auto;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;">
+      <div>
+        <h3>待审核提案</h3>
+        <p style="color:var(--text-dim);font-size:13px;">合并与 Dream 洞察在批准前不会修改已有记忆。</p>
+      </div>
+      <button onclick="loadReviewCenter()">刷新</button>
+    </div>
+    <div id="proposal-list"><div class="loading">加载中…</div></div>
+
+    <hr style="border-color:var(--border);margin:32px 0;" />
+
+    <h3>回收区</h3>
+    <p style="color:var(--text-dim);font-size:13px;margin-bottom:16px;">软删除记忆不会参与召回，可从这里恢复。</p>
+    <div id="trash-list"><div class="loading">加载中…</div></div>
+  </div>
 </div>
 
 <div class="content" id="import-view" style="display:none">
@@ -1045,10 +1065,12 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('list-view').style.display = target === 'list' ? '' : 'none';
     document.getElementById('breath-view').style.display = target === 'breath' ? '' : 'none';
     document.getElementById('network-view').style.display = target === 'network' ? '' : 'none';
+    document.getElementById('review-view').style.display = target === 'review' ? '' : 'none';
     document.getElementById('config-view').style.display = target === 'config' ? '' : 'none';
     document.getElementById('import-view').style.display = target === 'import' ? '' : 'none';
     document.getElementById('settings-view').style.display = target === 'settings' ? '' : 'none';
     if (target === 'network') loadNetwork();
+    if (target === 'review') loadReviewCenter();
     if (target === 'config') loadConfig();
     if (target === 'import') { pollImportStatus(); loadImportResults(); }
     if (target === 'settings') loadSettingsStatus();
@@ -1188,14 +1210,24 @@ async function showDetail(id) {
         '<div class="field"><label>模型视角</label>' + (meta.model_valence != null ? 'V' + meta.model_valence.toFixed(2) : '—') + '</div>' +
         '<div class="field"><label>重要度</label>' + (meta.importance || 5) + '/10</div>' +
         '<div class="field"><label>权重分</label>' + b.score.toFixed(4) + '</div>' +
-        '<div class="field"><label>激活次数</label>' + (meta.activation_count || 1) + '</div>' +
+        '<div class="field"><label>激活次数</label>' + (meta.activation_count ?? 0) + '</div>' +
+        '<div class="field"><label>命中 / 返回 / 确认</label>' + (meta.matched_count || 0) + ' / ' + (meta.recalled_count || 0) + ' / ' + (meta.confirmed_count || 0) + '</div>' +
+        '<div class="field"><label>作用域</label>' + esc(meta.scope || 'global') + '</div>' +
+        '<div class="field"><label>来源</label>' + esc(meta.source_type || 'unknown') + '</div>' +
+        '<div class="field"><label>内容类型</label>' + esc(meta.memory_kind || 'memory') + '</div>' +
+        '<div class="field"><label>来源引用</label>' + esc(meta.source_ref || '—') + '</div>' +
+        '<div class="field"><label>有效期</label>' + esc(meta.valid_until || '—') + '</div>' +
         '<div class="field"><label>已解决</label>' + (meta.resolved ? '✓' : '—') + '</div>' +
         '<div class="field"><label>已消化</label>' + (meta.digested ? '✓' : '—') + '</div>' +
         '<div class="field"><label>钉选</label>' + (meta.pinned ? '✓' : '—') + '</div>' +
         '<div class="field"><label>创建</label>' + (meta.created || '—') + '</div>' +
         '<div class="field"><label>最后活跃</label>' + (meta.last_active || '—') + '</div>' +
       '</div>' +
-      '<div class="detail-content">' + esc(b.content) + '</div>';
+      '<div class="detail-content">' + esc(b.content) + '</div>' +
+      '<div style="margin-top:22px;display:flex;justify-content:space-between;align-items:center;">' +
+        '<h3>变更历史</h3><button onclick="loadBucketHistory(\'' + id + '\')" style="font-size:12px;">刷新</button>' +
+      '</div><div id="bucket-history"><div class="loading">加载中…</div></div>';
+    loadBucketHistory(id);
   } catch (e) {
     content.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
   }
@@ -1203,6 +1235,133 @@ async function showDetail(id) {
 
 function closeDetail() {
   document.getElementById('detail-panel').classList.remove('open');
+}
+
+async function loadBucketHistory(id) {
+  var container = document.getElementById('bucket-history');
+  if (!container) return;
+  try {
+    var res = await authFetch(BASE + '/api/bucket/' + id + '/history');
+    if (!res) return;
+    var data = await res.json();
+    if (!data.events || !data.events.length) {
+      container.innerHTML = '<div class="loading">暂无历史</div>';
+      return;
+    }
+    container.innerHTML = data.events.map(function(e) {
+      return '<div style="padding:10px 0;border-bottom:1px solid var(--border);font-size:12px;">' +
+        '<div><b>' + esc(e.action) + '</b> · ' + esc(e.created_at) + '</div>' +
+        '<div style="color:var(--text-dim);">' + esc(e.actor) + ' · ' + esc(e.reason || '—') + '</div>' +
+        '<button onclick="rollbackBucket(\'' + id + '\',' + e.event_id + ')" style="font-size:11px;margin-top:5px;">回滚到此版本</button>' +
+      '</div>';
+    }).join('');
+  } catch (e) {
+    container.innerHTML = '<div class="loading">历史加载失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function rollbackBucket(id, eventId) {
+  if (!confirm('确认将该记忆回滚到事件 ' + eventId + '？当前版本仍会保留在审计历史中。')) return;
+  var res = await authFetch(BASE + '/api/bucket/' + id + '/rollback', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({event_id:eventId})
+  });
+  if (!res) return;
+  var data = await res.json();
+  if (!res.ok) return alert(data.error || '回滚失败');
+  await loadBuckets();
+  showDetail(id);
+}
+
+async function loadReviewCenter() {
+  await Promise.all([loadProposals(), loadTrash()]);
+}
+
+async function loadProposals() {
+  var container = document.getElementById('proposal-list');
+  try {
+    var res = await authFetch(BASE + '/api/proposals?status=pending');
+    if (!res) return;
+    var data = await res.json();
+    if (!data.proposals || !data.proposals.length) {
+      container.innerHTML = '<div class="loading">没有待审核提案</div>';
+      return;
+    }
+    container.innerHTML = data.proposals.map(function(p) {
+      return '<div class="config-section" style="margin-bottom:12px;">' +
+        '<div style="display:flex;justify-content:space-between;gap:16px;">' +
+          '<div><b>' + esc(p.proposal_type) + '</b> · <code>' + esc(p.proposal_id) + '</code>' +
+          '<div style="color:var(--text-dim);font-size:12px;">' + esc(p.scope) + ' · ' + esc(p.created_at) + '</div></div>' +
+          '<div style="display:flex;gap:6px;">' +
+            '<button onclick="showProposal(\'' + p.proposal_id + '\')">查看</button>' +
+            '<button onclick="reviewProposal(\'' + p.proposal_id + '\',\'approve\')">批准</button>' +
+            '<button onclick="reviewProposal(\'' + p.proposal_id + '\',\'reject\')">拒绝</button>' +
+          '</div></div><div style="margin-top:10px;">' + esc(p.summary) + '</div>' +
+        '<div id="proposal-' + p.proposal_id + '" style="display:none;margin-top:12px;"></div>' +
+      '</div>';
+    }).join('');
+  } catch (e) {
+    container.innerHTML = '<div class="loading">提案加载失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function showProposal(id) {
+  var container = document.getElementById('proposal-' + id);
+  if (!container) return;
+  if (container.style.display !== 'none') { container.style.display = 'none'; return; }
+  var res = await authFetch(BASE + '/api/proposals/' + id);
+  if (!res) return;
+  var p = await res.json();
+  var payload = p.payload || {};
+  container.innerHTML =
+    '<div style="font-size:12px;color:var(--text-dim);">拟执行内容</div>' +
+    '<pre style="white-space:pre-wrap;background:var(--surface);padding:12px;border-radius:8px;font-size:12px;">' + esc(JSON.stringify(payload, null, 2)) + '</pre>' +
+    (p.target_content != null ? '<h4>目标记忆</h4><div class="detail-content">' + esc(p.target_content) + '</div>' : '') +
+    (p.source_content != null ? '<h4 style="margin-top:10px;">源记忆</h4><div class="detail-content">' + esc(p.source_content) + '</div>' : '');
+  container.style.display = '';
+}
+
+async function reviewProposal(id, action) {
+  if (!confirm(action === 'approve' ? '确认批准并执行此提案？' : '确认拒绝此提案？记忆将保持不变。')) return;
+  var res = await authFetch(BASE + '/api/proposals/review', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({proposal_id:id, action:action})
+  });
+  if (!res) return;
+  var data = await res.json();
+  alert(data.message || (data.ok ? '已处理' : '处理失败'));
+  await loadReviewCenter();
+  await loadBuckets();
+}
+
+async function loadTrash() {
+  var container = document.getElementById('trash-list');
+  try {
+    var res = await authFetch(BASE + '/api/trash');
+    if (!res) return;
+    var data = await res.json();
+    if (!data.buckets || !data.buckets.length) {
+      container.innerHTML = '<div class="loading">回收区为空</div>';
+      return;
+    }
+    container.innerHTML = data.buckets.map(function(b) {
+      var meta = b.metadata || {};
+      return '<div class="config-section" style="margin-bottom:10px;display:flex;justify-content:space-between;gap:16px;">' +
+        '<div><b>' + esc(meta.name || b.id) + '</b><div style="font-size:12px;color:var(--text-dim);">' +
+        esc(b.id) + ' · ' + esc(b.deleted_at || '') + '</div><div style="font-size:12px;margin-top:6px;">' + esc((b.content || '').slice(0,180)) + '</div></div>' +
+        '<button onclick="restoreTrash(\'' + b.id + '\')">恢复</button></div>';
+    }).join('');
+  } catch (e) {
+    container.innerHTML = '<div class="loading">回收区加载失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function restoreTrash(id) {
+  if (!confirm('确认恢复记忆 ' + id + '？')) return;
+  var res = await authFetch(BASE + '/api/trash/' + id + '/restore', {method:'POST'});
+  if (!res) return;
+  if (!res.ok) return alert('恢复失败');
+  await loadReviewCenter();
+  await loadBuckets();
 }
 
 var networkData = null;
