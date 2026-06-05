@@ -41,6 +41,8 @@ import hashlib
 import hmac
 import secrets
 import time
+import tempfile
+import shutil
 import json as _json_lib
 import httpx
 from datetime import datetime, timedelta
@@ -58,7 +60,9 @@ from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from proposal_store import ProposalStore
+from snapshot_gate import SnapshotWriteGate
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
+from way_home import BACKUP_TYPES, BackupError, create_backup
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -105,6 +109,33 @@ dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 proposal_store = ProposalStore(config["buckets_dir"])
+backup_export_lock = asyncio.Lock()
+snapshot_write_gate = SnapshotWriteGate()
+
+
+def _gate_bucket_manager_writes(manager: BucketManager, gate: SnapshotWriteGate) -> None:
+    """Wrap bucket mutations so backup snapshots never interleave with file writes."""
+    for method_name in (
+        "create",
+        "update",
+        "delete",
+        "restore",
+        "restore_revision",
+        "touch",
+        "record_match",
+        "record_recall",
+        "archive",
+    ):
+        original = getattr(manager, method_name)
+
+        async def wrapped(*args, _original=original, **kwargs):
+            async with gate.writer():
+                return await _original(*args, **kwargs)
+
+        setattr(manager, method_name, wrapped)
+
+
+_gate_bucket_manager_writes(bucket_mgr, snapshot_write_gate)
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -204,6 +235,19 @@ def _require_auth(request):
             status_code=401,
         )
     return None
+
+
+def _backup_token_from_request(request) -> str:
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return request.headers.get("x-ombre-backup-token", "").strip()
+
+
+def _is_backup_token_valid(request) -> bool:
+    expected = os.environ.get("OMBRE_BACKUP_TOKEN", "").strip()
+    provided = _backup_token_from_request(request)
+    return bool(expected and provided and hmac.compare_digest(expected, provided))
 
 
 # --- Auth endpoints ---
@@ -430,6 +474,31 @@ async def dream_hook(request):
 # hold 和 grow 共用，避免重复逻辑
 # =============================================================
 async def _merge_or_create(
+    content: str,
+    tags: list,
+    importance: int,
+    domain: list,
+    valence: float,
+    arousal: float,
+    name: str = "",
+    source_type: str = "model_write",
+    scope: str = "global",
+) -> tuple[str, bool]:
+    async with snapshot_write_gate.writer():
+        return await _merge_or_create_locked(
+            content=content,
+            tags=tags,
+            importance=importance,
+            domain=domain,
+            valence=valence,
+            arousal=arousal,
+            name=name,
+            source_type=source_type,
+            scope=scope,
+        )
+
+
+async def _merge_or_create_locked(
     content: str,
     tags: list,
     importance: int,
@@ -1287,16 +1356,17 @@ async def dream(scope: str = "", insight: str = "", source_buckets: str = "") ->
 
     if insight.strip():
         source_ids = [item.strip() for item in source_buckets.split(",") if item.strip()]
-        proposal_id = proposal_store.create(
-            "dream_insight",
-            insight.strip()[:160],
-            {
-                "content": insight.strip(),
-                "source_bucket_ids": source_ids,
-                "valid_until": (datetime.now() + timedelta(days=30)).isoformat(timespec="seconds"),
-            },
-            scope=scope or "global",
-        )
+        async with snapshot_write_gate.writer():
+            proposal_id = proposal_store.create(
+                "dream_insight",
+                insight.strip()[:160],
+                {
+                    "content": insight.strip(),
+                    "source_bucket_ids": source_ids,
+                    "valid_until": (datetime.now() + timedelta(days=30)).isoformat(timespec="seconds"),
+                },
+                scope=scope or "global",
+            )
         return f"已生成 Dream 洞察提案: {proposal_id}"
 
     try:
@@ -1417,6 +1487,11 @@ async def dream(scope: str = "", insight: str = "", source_buckets: str = "") ->
 
 
 async def _apply_proposal(proposal_id: str, reviewer: str, note: str = "") -> tuple[bool, str]:
+    async with snapshot_write_gate.writer():
+        return await _apply_proposal_locked(proposal_id, reviewer, note)
+
+
+async def _apply_proposal_locked(proposal_id: str, reviewer: str, note: str = "") -> tuple[bool, str]:
     proposal = proposal_store.get(proposal_id)
     if not proposal or proposal["status"] != "pending":
         return False, "提案不存在或已处理"
@@ -1529,7 +1604,8 @@ async def review_proposals(
         success, message = await _apply_proposal(proposal_id, reviewer="review_proposals", note=note)
         return message if success else f"批准失败: {message}"
     if action == "reject":
-        success = proposal_store.resolve(proposal_id, "rejected", "review_proposals", note)
+        async with snapshot_write_gate.writer():
+            success = proposal_store.resolve(proposal_id, "rejected", "review_proposals", note)
         return "已拒绝提案，现有记忆保持不变。" if success else "拒绝失败：提案不存在或已处理。"
     return "action 仅支持 list、show、approve、reject。"
 
@@ -1547,6 +1623,60 @@ async def api_proposals(request):
     status = request.query_params.get("status", "pending")
     scope = request.query_params.get("scope", "")
     return JSONResponse({"proposals": proposal_store.list(status=status, scope=scope, limit=100)})
+
+
+@mcp.custom_route("/api/backup/export", methods=["POST"])
+async def api_backup_export(request):
+    """Create and return a protected, read-only disaster-recovery backup archive."""
+    from starlette.background import BackgroundTask
+    from starlette.responses import FileResponse, JSONResponse
+
+    if not os.environ.get("OMBRE_BACKUP_TOKEN", "").strip():
+        return JSONResponse({"error": "backup export is not configured"}, status_code=503)
+    if not _is_backup_token_valid(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    backup_type = request.query_params.get("type", "daily").strip().lower()
+    if backup_type not in BACKUP_TYPES:
+        return JSONResponse({"error": "invalid backup type"}, status_code=400)
+    include_derived = request.query_params.get("include_derived", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+    if getattr(import_engine, "is_running", False):
+        return JSONResponse({"error": "import is running; retry after it finishes or pauses"}, status_code=409)
+    if backup_export_lock.locked():
+        return JSONResponse({"error": "backup export already running"}, status_code=409)
+
+    temp_dir = tempfile.mkdtemp(prefix="ombre-backup-export-")
+    try:
+        async with backup_export_lock:
+            async with snapshot_write_gate.snapshot():
+                result = create_backup(
+                    config["buckets_dir"],
+                    temp_dir,
+                    backup_type=backup_type,
+                    include_derived=include_derived,
+                    app_commit=os.environ.get("OMBRE_APP_COMMIT", "unknown"),
+                )
+        archive_path = result["archive"]
+        response = FileResponse(
+            archive_path,
+            media_type="application/zip",
+            filename=os.path.basename(archive_path),
+            background=BackgroundTask(shutil.rmtree, temp_dir, ignore_errors=True),
+        )
+        response.headers["X-Ombre-Backup-Sha256"] = result["sha256"]
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except BackupError as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.exception("Backup export failed")
+        return JSONResponse({"error": f"backup export failed: {e}"}, status_code=500)
 
 
 @mcp.custom_route("/api/proposals/{proposal_id}", methods=["GET"])
@@ -1584,7 +1714,8 @@ async def api_proposals_review(request):
     if action == "approve":
         success, message = await _apply_proposal(proposal_id, reviewer="dashboard", note=note)
     else:
-        success = proposal_store.resolve(proposal_id, "rejected", "dashboard", note)
+        async with snapshot_write_gate.writer():
+            success = proposal_store.resolve(proposal_id, "rejected", "dashboard", note)
         message = "已拒绝提案，现有记忆保持不变。" if success else "提案不存在或已处理。"
     return JSONResponse({"ok": success, "message": message}, status_code=200 if success else 409)
 

@@ -43,3 +43,8 @@
 ```
 
 Webhook 推送失败仅在服务日志中以 WARNING 级别记录，**不会影响 MCP 工具的正常返回**。
+## Backup / The Way Home
+
+- `OMBRE_BACKUP_TOKEN` — independent bearer token for `POST /api/backup/export`.
+  This token is only accepted in the `Authorization: Bearer ...` header or
+  `X-Ombre-Backup-Token`; never put it in a URL.
