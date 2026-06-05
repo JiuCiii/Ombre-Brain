@@ -23,6 +23,8 @@ services:
         value: gemini-embedding-001
       - key: OMBRE_BUCKETS_DIR
         value: /opt/render/project/src/buckets
+      - key: OMBRE_APP_COMMIT
+        value: 14b8876
       - key: OMBRE_BACKUP_TOKEN
         sync: false          # Independent bearer token for read-only backup exports
     disk:
