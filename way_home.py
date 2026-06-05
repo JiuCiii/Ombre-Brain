@@ -27,6 +27,8 @@ DERIVED_DATABASES = {"embeddings.db", "dehydration_cache.db"}
 REQUIRED_DATABASES = {".ombre/audit.db", ".ombre/proposals.db"}
 SENSITIVE_FILES = {".dashboard_auth.json"}
 EXCLUDED_FILES = {"import_state.json"}
+EXCLUDED_PREFIXES = ("backup-before-safety-",)
+EXCLUDED_SUFFIXES = (".tar.gz", ".tgz")
 MAX_ARCHIVE_FILES = 10_000
 MAX_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024
 
@@ -57,6 +59,12 @@ def _classification(relative_path: str) -> str | None:
     if relative_path in SENSITIVE_FILES:
         return "sensitive"
     if relative_path in EXCLUDED_FILES:
+        return "intentionally_excluded"
+    if (
+        "/" not in relative_path
+        and relative_path.startswith(EXCLUDED_PREFIXES)
+        and relative_path.endswith(EXCLUDED_SUFFIXES)
+    ):
         return "intentionally_excluded"
     if relative_path.endswith(("-wal", "-shm")):
         base = relative_path.rsplit("-", 1)[0]

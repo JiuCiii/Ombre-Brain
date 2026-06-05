@@ -64,6 +64,20 @@ def test_unknown_persistent_asset_stops_backup(tmp_path):
         discover_assets(buckets)
 
 
+def test_legacy_migration_backup_is_explicitly_excluded(tmp_path):
+    buckets = tmp_path / "buckets"
+    _seed_buckets(buckets)
+    legacy = buckets / "backup-before-safety-20260604-085140.tar.gz"
+    legacy.write_bytes(b"legacy backup")
+
+    discovered = discover_assets(buckets)
+
+    assert {
+        "path": "backup-before-safety-20260604-085140.tar.gz",
+        "classification": "intentionally_excluded",
+    } in discovered["excluded"]
+
+
 def test_archive_hash_corruption_is_detected(tmp_path):
     buckets = tmp_path / "buckets"
     _seed_buckets(buckets)
