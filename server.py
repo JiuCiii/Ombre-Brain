@@ -250,6 +250,15 @@ def _is_backup_token_valid(request) -> bool:
     return bool(expected and provided and hmac.compare_digest(expected, provided))
 
 
+def _deployed_commit() -> str:
+    """Return the actual deploy commit when the platform provides it."""
+    return (
+        os.environ.get("RENDER_GIT_COMMIT", "").strip()
+        or os.environ.get("OMBRE_APP_COMMIT", "").strip()
+        or "unknown"
+    )
+
+
 # --- Auth endpoints ---
 @mcp.custom_route("/auth/status", methods=["GET"])
 async def auth_status(request):
@@ -358,6 +367,7 @@ async def health_check(request):
             "status": "ok",
             "buckets": stats["permanent_count"] + stats["dynamic_count"],
             "decay_engine": "running" if decay_engine.is_running else "stopped",
+            "commit": _deployed_commit(),
         })
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
@@ -1658,7 +1668,7 @@ async def api_backup_export(request):
                     temp_dir,
                     backup_type=backup_type,
                     include_derived=include_derived,
-                    app_commit=os.environ.get("OMBRE_APP_COMMIT", "unknown"),
+                    app_commit=_deployed_commit(),
                 )
         archive_path = result["archive"]
         response = FileResponse(

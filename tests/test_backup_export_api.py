@@ -15,6 +15,34 @@ class _Request:
         self.query_params = query_params or {}
 
 
+def test_deployed_commit_prefers_render_value(monkeypatch):
+    import server
+
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "render-sha")
+    monkeypatch.setenv("OMBRE_APP_COMMIT", "manual-sha")
+    assert server._deployed_commit() == "render-sha"
+
+    monkeypatch.delenv("RENDER_GIT_COMMIT")
+    assert server._deployed_commit() == "manual-sha"
+
+
+@pytest.mark.asyncio
+async def test_health_reports_deployed_commit(monkeypatch):
+    import server
+
+    class _BucketManager:
+        async def get_stats(self):
+            return {"permanent_count": 2, "dynamic_count": 3}
+
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "deployed-sha")
+    monkeypatch.setattr(server, "bucket_mgr", _BucketManager())
+    response = await server.health_check(_Request())
+
+    assert response.status_code == 200
+    assert b'"buckets":5' in response.body
+    assert b'"commit":"deployed-sha"' in response.body
+
+
 @pytest.mark.asyncio
 async def test_backup_export_requires_independent_token(monkeypatch):
     import server
